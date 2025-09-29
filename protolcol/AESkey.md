@@ -61,3 +61,22 @@
 - 开发与抓包时避免泄露会话密钥与 id。
 - 认证失败时检查响应错误码（response[0x22:0x24]）与校验范围。
 - 负载与整包校验均基于简单求和+0xBEAF，大小端按字段说明写入。
+
+
+- 新增: examples/get_aes_key.py
+    - 通过 UDP 发送认证指令（packet_type=0x65），解密响应并输出设备 id 与会话 AES Key。
+    - 若未提供 devtype 与 mac，会先对目标 IP 单播 hello 自动获取。
+    - 含完整中文注释，独立可运行；使用与本库一致的初始 AES Key/IV 和协议细节。
+
+用法
+
+- 自动发现 devtype/mac:
+    - python examples/get_aes_key.py --host 192.168.1.16
+- 指定本机网卡:
+    - python examples/get_aes_key.py --host 192.168.1.16 --ip 192.168.1.100
+- 手动提供 devtype 与 mac:
+    - python examples/get_aes_key.py --host 192.168.1.16 --devtype 0x2737 --mac aa:bb:cc:dd:ee:ff
+
+输出
+
+- 设备 IP、设备类型、MAC、设备 ID、会话 AES Key（hex）。
