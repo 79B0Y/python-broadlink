@@ -1,0 +1,1409 @@
+#!/usr/bin/env python3
+"""Standalone Broadlink UDP tool.
+
+This script sends raw UDP packets to Broadlink devices on the LAN using
+the documented packet format. It allows providing the AES key, device id,
+device type, MAC, and building command payloads for generic control and
+status queries.
+
+Quick examples:
+- Auth (gets session AES key and device id):
+  ./cli/broadlink_udp auth --host 192.168.1.50 --mac aabbccddeeff --devtype 0x2712
+
+- Send a generic 0x6A packet with a hex payload (post-auth):
+  ./cli/broadlink_udp send --host 192.168.1.50 \
+      --mac aabbccddeeff --devtype 0x2712 --id 0x12345678 \
+      --key 097628343fe99e23765c1513accf8b02 \
+      --payload 03000000000000000000000000000000
+
+- Ping watchdog (firmware >= v53):
+  ./cli/broadlink_udp ping --host 192.168.1.50
+
+Notes:
+- MAC should be provided as hex without separators (aa11bb22cc33) or with
+  separators (aa:11:bb:22:cc:33). The tool will normalize it.
+- Keys and ids can be provided as hex with 0x prefix or plain hex.
+"""
+
+import argparse
+import os
+import random
+import socket
+import struct
+import sys
+import time
+from typing import Tuple
+
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+
+DEFAULT_PORT = 80
+DEFAULT_TIMEOUT = 10
+DEFAULT_RETRY_INTVL = 1
+
+# Broadlink packet constants
+MAGIC = bytes.fromhex("5aa5aa555aa5aa55")
+CHECKSUM_INIT = 0xBEAF
+INIT_KEY = bytes.fromhex("097628343fe99e23765c1513accf8b02")
+INIT_IV = bytes.fromhex("562e17996d093d28ddb3ba695a2e6f58")
+
+
+def _auto_int_hex(s: str) -> int:
+    s = s.strip().lower()
+    if s.startswith("0x"):
+        return int(s, 16)
+    # Allow plain hex of even length
+    try:
+        if all(c in "0123456789abcdef" for c in s) and len(s) <= 8:
+            return int(s, 16)
+    except Exception:
+        pass
+    return int(s, 0)
+
+
+def _parse_hex_bytes(s: str) -> bytes:
+    s = s.replace(":", "").replace("-", "").replace(" ", "").strip()
+    if s.startswith("0x"):
+        s = s[2:]
+    if len(s) % 2 != 0:
+        raise ValueError("hex input must have even length")
+    return bytes.fromhex(s)
+
+
+def _checksum(data: bytes, start: int = CHECKSUM_INIT) -> int:
+    return (sum(data, start) & 0xFFFF)
+
+
+def _aes(key: bytes, iv: bytes) -> Tuple[Cipher, Cipher]:
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    return cipher.encryptor(), cipher.decryptor()
+
+
+def _encrypt(key: bytes, iv: bytes, payload: bytes) -> bytes:
+    pad = (16 - (len(payload) % 16)) % 16
+    encryptor, _ = _aes(key, iv)
+    return encryptor.update(payload + bytes(pad)) + encryptor.finalize()
+
+
+def _decrypt(key: bytes, iv: bytes, payload: bytes) -> bytes:
+    _, decryptor = _aes(key, iv)
+    return decryptor.update(payload) + decryptor.finalize()
+
+
+def _send_udp(host: str, port: int, data: bytes, timeout: int) -> bytes:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        start = time.time()
+        while True:
+            left = max(0.01, timeout - (time.time() - start))
+            if left <= 0:
+                raise TimeoutError(f"No response within {timeout}s")
+            s.settimeout(min(DEFAULT_RETRY_INTVL, left))
+            s.sendto(data, (host, port))
+            try:
+                resp = s.recvfrom(4096)[0]
+                return resp
+            except socket.timeout:
+                if (time.time() - start) > timeout:
+                    raise TimeoutError(f"No response within {timeout}s")
+
+
+def _build_cmd_packet(
+    devtype: int,
+    packet_type: int,
+    count: int,
+    mac: bytes,
+    devid: int,
+    key: bytes,
+    iv: bytes,
+    payload: bytes,
+) -> bytes:
+    # Header
+    header = bytearray(0x38)
+    header[0x00:0x08] = MAGIC
+    header[0x24:0x26] = devtype.to_bytes(2, "little")
+    header[0x26:0x28] = packet_type.to_bytes(2, "little")
+    header[0x28:0x2A] = count.to_bytes(2, "little")
+    header[0x2A:0x30] = mac[::-1]
+    header[0x30:0x34] = devid.to_bytes(4, "little")
+
+    pchk = _checksum(payload)
+    header[0x34:0x36] = pchk.to_bytes(2, "little")
+
+    crypt = _encrypt(key, iv, payload)
+    packet = header + crypt
+
+    chk = _checksum(packet)
+    packet[0x20:0x22] = chk.to_bytes(2, "little")
+    return bytes(packet)
+
+
+def _parse_resp_and_decrypt(resp: bytes, key: bytes, iv: bytes) -> Tuple[int, bytes]:
+    if len(resp) < 0x30:
+        raise ValueError(f"Response too short: {len(resp)} bytes")
+    nom = int.from_bytes(resp[0x20:0x22], "little")
+    real = (_checksum(resp) - sum(resp[0x20:0x22])) & 0xFFFF
+    if nom != real:
+        raise ValueError(f"Checksum mismatch: expected {nom}, got {real}")
+    err = int.from_bytes(resp[0x22:0x24], "little")
+    enc = resp[0x38:]
+    dec = _decrypt(key, iv, enc) if enc else b""
+    return err, dec
+
+
+def cmd_auth(args) -> int:
+    key = INIT_KEY
+    iv = INIT_IV
+    devid = 0
+    count = random.randint(0x8000, 0xFFFF)
+
+    payload = bytearray(0x50)
+    payload[0x04:0x14] = [0x31] * 16  # "IMEI" placeholder as library does
+    payload[0x1E] = 0x01
+    payload[0x2D] = 0x01
+    name = (args.name or "UDP Tool").encode()
+    payload[0x30 : 0x30 + min(6, len(name))] = name[:6]
+
+    packet = _build_cmd_packet(
+        args.devtype, 0x65, count, args.mac, devid, key, iv, bytes(payload)
+    )
+    resp = _send_udp(args.host, args.port, packet, args.timeout)
+    err, dec = _parse_resp_and_decrypt(resp, key, iv)
+    if err != 0:
+        print(f"error={err}")
+        return 1
+    new_id = int.from_bytes(dec[:0x4], "little")
+    new_key = dec[0x04:0x14]
+    print(
+        "{"
+        f"\"id\": {new_id}, "
+        f"\"key\": \"{new_key.hex()}\""
+        "}"
+    )
+    return 0
+
+
+def cmd_send(args) -> int:
+    key = _parse_hex_bytes(args.key) if args.key else INIT_KEY
+    iv = _parse_hex_bytes(args.iv) if args.iv else INIT_IV
+    devid = _auto_int_hex(args.id) if args.id is not None else 0
+    count = _auto_int_hex(args.count) if args.count is not None else random.randint(
+        0x8000, 0xFFFF
+    )
+    payload = _parse_hex_bytes(args.payload)
+
+    packet = _build_cmd_packet(
+        args.devtype, args.packet_type, count, args.mac, devid, key, iv, payload
+    )
+    resp = _send_udp(args.host, args.port, packet, args.timeout)
+    err, dec = _parse_resp_and_decrypt(resp, key, iv)
+    print(f"resp_err={err}")
+    print(f"resp_len={len(resp)}")
+    print(f"resp_hex={resp.hex()}")
+    print(f"dec_hex={dec.hex()}")
+    return 0 if err == 0 else 1
+
+
+def cmd_ping(args) -> int:
+    pkt = bytearray(0x30)
+    pkt[0x26] = 1
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.settimeout(args.timeout)
+        s.sendto(pkt, (args.host, args.port))
+    print("ok")
+    return 0
+
+
+def _send_cmd6a(
+    host: str,
+    port: int,
+    timeout: int,
+    devtype: int,
+    mac: bytes,
+    devid: int,
+    key: bytes,
+    iv: bytes,
+    payload: bytes,
+    count: int = None,
+):
+    cnt = (
+        count
+        if count is not None
+        else random.randint(0x8000, 0xFFFF)
+    )
+    packet = _build_cmd_packet(
+        devtype, 0x6A, cnt, mac, devid, key, iv, payload
+    )
+    resp = _send_udp(host, port, packet, timeout)
+    err, dec = _parse_resp_and_decrypt(resp, key, iv)
+    return err, dec
+
+
+def _is_rm_minib_protocol(devtype: int) -> bool:
+    # Heuristic: new RM miniB/RM4 devices use higher product ids.
+    # Include a set of known ids; also treat >= 0x5000 as new.
+    rm4 = {
+        0x51DA, 0x5209, 0x520C, 0x520D, 0x5211, 0x5212, 0x5216, 0x521C,
+        0x6070, 0x610E, 0x610F, 0x62BC, 0x62BE, 0x6364, 0x648D, 0x6539,
+        0x653A, 0x520B, 0x5213, 0x5218, 0x6026, 0x6184, 0x61A2, 0x649B,
+        0x653C,
+    }
+    rmminib = {0x5F36, 0x6507, 0x6508}
+    return devtype in rm4 or devtype in rmminib or devtype >= 0x5000
+
+
+def _rm_build_inner(devtype: int, command: int, data: bytes = b"") -> bytes:
+    if _is_rm_minib_protocol(devtype):
+        inner_len = 4 + len(data)
+        return struct.pack("<HI", inner_len, command) + data
+    else:
+        return struct.pack("<I", command) + data
+
+
+def _rm_extract_data(devtype: int, dec: bytes) -> bytes:
+    if _is_rm_minib_protocol(devtype):
+        if len(dec) < 6:
+            return b""
+        p_len = struct.unpack_from("<H", dec, 0)[0]
+        return dec[0x6 : 0x2 + p_len]
+    else:
+        return dec[0x4:]
+
+
+def cmd_rm_learn(args) -> int:
+    key = _parse_hex_bytes(args.key) if args.key else INIT_KEY
+    iv = _parse_hex_bytes(args.iv) if args.iv else INIT_IV
+    devid = _auto_int_hex(args.id)
+    inner = _rm_build_inner(args.devtype, 0x03)
+    err, _ = _send_cmd6a(
+        args.host, args.port, args.timeout, args.devtype,
+        args.mac, devid, key, iv, inner,
+    )
+    print(f"resp_err={err}")
+    return 0 if err == 0 else 1
+
+
+def cmd_rm_check(args) -> int:
+    key = _parse_hex_bytes(args.key)
+    iv = _parse_hex_bytes(args.iv) if args.iv else INIT_IV
+    devid = _auto_int_hex(args.id)
+    inner = _rm_build_inner(args.devtype, 0x04)
+    err, dec = _send_cmd6a(
+        args.host, args.port, args.timeout, args.devtype,
+        args.mac, devid, key, iv, inner,
+    )
+    code = _rm_extract_data(args.devtype, dec)
+    print(f"resp_err={err}")
+    print(f"code_hex={code.hex()}")
+    return 0 if err == 0 else 1
+
+
+def cmd_rm_send(args) -> int:
+    key = _parse_hex_bytes(args.key)
+    iv = _parse_hex_bytes(args.iv) if args.iv else INIT_IV
+    devid = _auto_int_hex(args.id)
+    data = _parse_hex_bytes(args.data)
+    inner = _rm_build_inner(args.devtype, 0x02, data)
+    err, dec = _send_cmd6a(
+        args.host, args.port, args.timeout, args.devtype,
+        args.mac, devid, key, iv, inner,
+    )
+    print(f"resp_err={err}")
+    print(f"dec_hex={dec.hex()}")
+    return 0 if err == 0 else 1
+
+
+def cmd_rm_rf_ops(args) -> int:
+    key = _parse_hex_bytes(args.key)
+    iv = _parse_hex_bytes(args.iv) if args.iv else INIT_IV
+    devid = _auto_int_hex(args.id)
+    if args.action == "sweep":
+        inner = _rm_build_inner(args.devtype, 0x19)
+        err, _ = _send_cmd6a(
+            args.host, args.port, args.timeout, args.devtype,
+            args.mac, devid, key, iv, inner,
+        )
+        print(f"resp_err={err}")
+        return 0 if err == 0 else 1
+
+    if args.action == "check":
+        inner = _rm_build_inner(args.devtype, 0x1A)
+        err, dec = _send_cmd6a(
+            args.host, args.port, args.timeout, args.devtype,
+            args.mac, devid, key, iv, inner,
+        )
+        data = _rm_extract_data(args.devtype, dec)
+        found = bool(data[0]) if data else False
+        freq = (
+            struct.unpack_from("<I", data, 1)[0] / 1000.0
+            if len(data) >= 5
+            else 0.0
+        )
+        print(f"resp_err={err}")
+        print(f"found={str(found).lower()} frequency_mhz={freq}")
+        return 0 if err == 0 else 1
+
+    if args.action == "find":
+        data = b""
+        if args.frequency:
+            data = struct.pack("<I", int(float(args.frequency) * 1000))
+        inner = _rm_build_inner(args.devtype, 0x1B, data)
+        err, _ = _send_cmd6a(
+            args.host, args.port, args.timeout, args.devtype,
+            args.mac, devid, key, iv, inner,
+        )
+        print(f"resp_err={err}")
+        return 0 if err == 0 else 1
+
+    if args.action == "cancel":
+        inner = _rm_build_inner(args.devtype, 0x1E)
+        err, _ = _send_cmd6a(
+            args.host, args.port, args.timeout, args.devtype,
+            args.mac, devid, key, iv, inner,
+        )
+        print(f"resp_err={err}")
+        return 0 if err == 0 else 1
+
+    return 2
+
+
+def cmd_rm4_sensors(args) -> int:
+    key = _parse_hex_bytes(args.key)
+    iv = _parse_hex_bytes(args.iv) if args.iv else INIT_IV
+    devid = _auto_int_hex(args.id)
+    inner = _rm_build_inner(args.devtype, 0x24)
+    err, dec = _send_cmd6a(
+        args.host, args.port, args.timeout, args.devtype,
+        args.mac, devid, key, iv, inner,
+    )
+    data = _rm_extract_data(args.devtype, dec)
+    t = data[0] + data[1] / 100.0 if len(data) >= 2 else None
+    h = data[2] + data[3] / 100.0 if len(data) >= 4 else None
+    print(f"resp_err={err}")
+    if t is not None:
+        print(f"temperature={t}")
+    if h is not None:
+        print(f"humidity={h}")
+    return 0 if err == 0 else 1
+
+
+def cmd_sp2_get_power(args) -> int:
+    key = _parse_hex_bytes(args.key)
+    iv = _parse_hex_bytes(args.iv) if args.iv else INIT_IV
+    devid = _auto_int_hex(args.id)
+    payload = bytearray(16)
+    payload[0] = 1
+    err, dec = _send_cmd6a(
+        args.host, args.port, args.timeout, args.devtype,
+        args.mac, devid, key, iv, bytes(payload),
+    )
+    power = bool(dec[0x4] & 1) if len(dec) >= 5 else False
+    print(f"resp_err={err}")
+    print(f"power={'on' if power else 'off'}")
+    return 0 if err == 0 else 1
+
+
+def cmd_sp2_set_power(args) -> int:
+    key = _parse_hex_bytes(args.key)
+    iv = _parse_hex_bytes(args.iv) if args.iv else INIT_IV
+    devid = _auto_int_hex(args.id)
+    payload = bytearray(16)
+    payload[0] = 2
+    payload[4] = 1 if args.on else 0
+    err, _ = _send_cmd6a(
+        args.host, args.port, args.timeout, args.devtype,
+        args.mac, devid, key, iv, bytes(payload),
+    )
+    print(f"resp_err={err}")
+    return 0 if err == 0 else 1
+
+
+def _sp4_build_json(flag: int, state: dict, variant: str) -> bytes:
+    js = ("{" + ",".join(
+        f'"{k}":{v}' if isinstance(v, (int, float)) else f'"{k}":{v}'
+        if v in ("true", "false") else f'"{k}":{int(bool(v))}'
+        for k, v in state.items()
+    ) + "}").encode()
+
+    if variant == "b":
+        packet = bytearray(14)
+        length = 12 + len(js)
+        struct.pack_into(
+            "<HHHHBBI",
+            packet,
+            0,
+            length,
+            0xA5A5,
+            0x5A5A,
+            0x0000,
+            flag,
+            0x0B,
+            len(js),
+        )
+        packet.extend(js)
+        checksum = _checksum(packet[0x02:])
+        packet[0x06:0x08] = checksum.to_bytes(2, "little")
+        return bytes(packet)
+    else:
+        packet = bytearray(12)
+        struct.pack_into(
+            "<HHHBBI", packet, 0, 0xA5A5, 0x5A5A, 0x0000, flag, 0x0B, len(js)
+        )
+        packet.extend(js)
+        checksum = _checksum(packet)
+        packet[0x04:0x06] = checksum.to_bytes(2, "little")
+        return bytes(packet)
+
+
+def _sp4_decode_json(dec: bytes, variant: str) -> str:
+    if variant == "b":
+        js_len = struct.unpack_from("<I", dec, 0x0A)[0]
+        return dec[0x0E : 0x0E + js_len].decode(errors="ignore")
+    else:
+        js_len = struct.unpack_from("<I", dec, 0x08)[0]
+        return dec[0x0C : 0x0C + js_len].decode(errors="ignore")
+
+
+def cmd_sp4_get(args) -> int:
+    key = _parse_hex_bytes(args.key)
+    iv = _parse_hex_bytes(args.iv) if args.iv else INIT_IV
+    devid = _auto_int_hex(args.id)
+    inner = _sp4_build_json(1, {}, args.variant)
+    err, dec = _send_cmd6a(
+        args.host, args.port, args.timeout, args.devtype,
+        args.mac, devid, key, iv, inner,
+    )
+    js = _sp4_decode_json(dec, args.variant)
+    print(f"resp_err={err}")
+    print(js)
+    return 0 if err == 0 else 1
+
+
+def cmd_sp4_set(args) -> int:
+    key = _parse_hex_bytes(args.key)
+    iv = _parse_hex_bytes(args.iv) if args.iv else INIT_IV
+    devid = _auto_int_hex(args.id)
+    # Parse key=value pairs
+    state = {}
+    for kv in args.state:
+        if "=" not in kv:
+            continue
+        k, v = kv.split("=", 1)
+        v_lower = v.lower()
+        if v_lower in ("true", "false"):
+            state[k] = v_lower
+        else:
+            try:
+                state[k] = int(v)
+            except ValueError:
+                state[k] = v
+
+    inner = _sp4_build_json(2, state, args.variant)
+    err, dec = _send_cmd6a(
+        args.host, args.port, args.timeout, args.devtype,
+        args.mac, devid, key, iv, inner,
+    )
+    js = _sp4_decode_json(dec, args.variant)
+    print(f"resp_err={err}")
+    print(js)
+    return 0 if err == 0 else 1
+
+
+def cmd_sp2s_energy(args) -> int:
+    key = _parse_hex_bytes(args.key)
+    iv = _parse_hex_bytes(args.iv) if args.iv else INIT_IV
+    devid = _auto_int_hex(args.id)
+    payload = bytearray(16)
+    payload[0] = 4
+    err, dec = _send_cmd6a(
+        args.host, args.port, args.timeout, args.devtype,
+        args.mac, devid, key, iv, bytes(payload),
+    )
+    # payload[0x4:0x7] little-endian milliwatt
+    w = 0
+    if len(dec) >= 7:
+        w = int.from_bytes(dec[0x4:0x7], "little") / 1000.0
+    print(f"resp_err={err}")
+    print(f"power_w={w}")
+    return 0 if err == 0 else 1
+
+
+def cmd_a1_sensors(args) -> int:
+    key = _parse_hex_bytes(args.key)
+    iv = _parse_hex_bytes(args.iv) if args.iv else INIT_IV
+    devid = _auto_int_hex(args.id)
+    payload = bytes([0x01])
+    err, dec = _send_cmd6a(
+        args.host, args.port, args.timeout, args.devtype,
+        args.mac, devid, key, iv, payload,
+    )
+    t = dec[0x04] + dec[0x05] / 10.0 if len(dec) > 0x05 else None
+    h = dec[0x06] + dec[0x07] / 10.0 if len(dec) > 0x07 else None
+    print(f"resp_err={err}")
+    if t is not None:
+        print(f"temperature={t}")
+    if h is not None:
+        print(f"humidity={h}")
+    return 0 if err == 0 else 1
+
+
+# ---------- SP3 helpers (nightlight) ----------
+
+def _sp3_read(args) -> bytes:
+    key = _parse_hex_bytes(args.key)
+    iv = _parse_hex_bytes(args.iv) if args.iv else INIT_IV
+    devid = _auto_int_hex(args.id)
+    payload = bytearray(16)
+    payload[0] = 1
+    err, dec = _send_cmd6a(
+        args.host, args.port, args.timeout, args.devtype,
+        args.mac, devid, key, iv, bytes(payload),
+    )
+    print(f"resp_err={err}")
+    return dec
+
+
+def cmd_sp3_get_power(args) -> int:
+    dec = _sp3_read(args)
+    power = bool(dec[0x4] & 1) if len(dec) >= 5 else False
+    print(f"power={'on' if power else 'off'}")
+    return 0
+
+
+def cmd_sp3_get_nl(args) -> int:
+    dec = _sp3_read(args)
+    nl = bool(dec[0x4] & 2) if len(dec) >= 5 else False
+    print(f"nightlight={'on' if nl else 'off'}")
+    return 0
+
+
+def cmd_sp3_set_power(args) -> int:
+    key = _parse_hex_bytes(args.key)
+    iv = _parse_hex_bytes(args.iv) if args.iv else INIT_IV
+    devid = _auto_int_hex(args.id)
+    # Need to preserve NL bit
+    dec = _sp3_read(args)
+    nl = 1 if (len(dec) >= 5 and (dec[4] & 2)) else 0
+    payload = bytearray(16)
+    payload[0] = 2
+    payload[4] = (nl << 1) | (1 if args.on else 0)
+    err, _ = _send_cmd6a(
+        args.host, args.port, args.timeout, args.devtype,
+        args.mac, devid, key, iv, bytes(payload),
+    )
+    print(f"resp_err={err}")
+    return 0 if err == 0 else 1
+
+
+def cmd_sp3_set_nl(args) -> int:
+    key = _parse_hex_bytes(args.key)
+    iv = _parse_hex_bytes(args.iv) if args.iv else INIT_IV
+    devid = _auto_int_hex(args.id)
+    dec = _sp3_read(args)
+    pwr = 1 if (len(dec) >= 5 and (dec[4] & 1)) else 0
+    payload = bytearray(16)
+    payload[0] = 2
+    payload[4] = ((1 if args.on else 0) << 1) | pwr
+    err, _ = _send_cmd6a(
+        args.host, args.port, args.timeout, args.devtype,
+        args.mac, devid, key, iv, bytes(payload),
+    )
+    print(f"resp_err={err}")
+    return 0 if err == 0 else 1
+
+
+# ---------- MP1 helpers ----------
+
+def cmd_mp1_get(args) -> int:
+    key = _parse_hex_bytes(args.key)
+    iv = _parse_hex_bytes(args.iv) if args.iv else INIT_IV
+    devid = _auto_int_hex(args.id)
+    packet = bytearray(16)
+    packet[0x00] = 0x0A
+    packet[0x02] = 0xA5
+    packet[0x03] = 0xA5
+    packet[0x04] = 0x5A
+    packet[0x05] = 0x5A
+    packet[0x06] = 0xAE
+    packet[0x07] = 0xC0
+    packet[0x08] = 0x01
+    err, dec = _send_cmd6a(
+        args.host, args.port, args.timeout, args.devtype,
+        args.mac, devid, key, iv, bytes(packet),
+    )
+    raw = dec[0x0E] if len(dec) > 0x0E else 0
+    print(f"resp_err={err}")
+    print(
+        "{\"s1\":%s,\"s2\":%s,\"s3\":%s,\"s4\":%s}" % (
+            str(bool(raw & 1)).lower(),
+            str(bool(raw & 2)).lower(),
+            str(bool(raw & 4)).lower(),
+            str(bool(raw & 8)).lower(),
+        )
+    )
+    return 0 if err == 0 else 1
+
+
+def cmd_mp1_set(args) -> int:
+    key = _parse_hex_bytes(args.key)
+    iv = _parse_hex_bytes(args.iv) if args.iv else INIT_IV
+    devid = _auto_int_hex(args.id)
+    if args.sid is None and args.mask is None:
+        raise ValueError("provide --sid (1-4) or --mask")
+    sid_mask = (1 << (args.sid - 1)) if args.sid else _auto_int_hex(args.mask)
+    packet = bytearray(16)
+    packet[0x00] = 0x0D
+    packet[0x02] = 0xA5
+    packet[0x03] = 0xA5
+    packet[0x04] = 0x5A
+    packet[0x05] = 0x5A
+    packet[0x06] = 0xB2 + ((sid_mask << 1) if args.on else sid_mask)
+    packet[0x07] = 0xC0
+    packet[0x08] = 0x02
+    packet[0x0A] = 0x03
+    packet[0x0D] = sid_mask & 0xFF
+    packet[0x0E] = sid_mask & 0xFF if args.on else 0
+    err, _ = _send_cmd6a(
+        args.host, args.port, args.timeout, args.devtype,
+        args.mac, devid, key, iv, bytes(packet),
+    )
+    print(f"resp_err={err}")
+    return 0 if err == 0 else 1
+
+
+# ---------- Dooya covers ----------
+
+def _is_dooya_v2(devtype: int, variant: str = None) -> bool:
+    if variant:
+        return variant == "v2"
+    return devtype in {0x4F6E}
+
+
+def _dooya_v1_send(args, command: int, attribute: int = 0) -> bytes:
+    key = _parse_hex_bytes(args.key)
+    iv = _parse_hex_bytes(args.iv) if args.iv else INIT_IV
+    devid = _auto_int_hex(args.id)
+    pkt = bytearray(16)
+    pkt[0x00] = 0x09
+    pkt[0x02] = 0xBB
+    pkt[0x03] = command
+    pkt[0x04] = attribute
+    pkt[0x09] = 0xFA
+    pkt[0x0A] = 0x44
+    err, dec = _send_cmd6a(
+        args.host, args.port, args.timeout, args.devtype,
+        args.mac, devid, key, iv, bytes(pkt),
+    )
+    if err != 0:
+        print(f"resp_err={err}")
+    return dec
+
+
+def _dooya_v2_send(args, operation: int, data: bytes = b"") -> bytes:
+    key = _parse_hex_bytes(args.key)
+    iv = _parse_hex_bytes(args.iv) if args.iv else INIT_IV
+    devid = _auto_int_hex(args.id)
+    pkt = bytearray(12)
+    pkt[0x02] = 0xA5
+    pkt[0x03] = 0xA5
+    pkt[0x04] = 0x5A
+    pkt[0x05] = 0x5A
+    pkt[0x08] = operation
+    pkt[0x09] = 0x0B
+    if data:
+        pkt[0x0A] = len(data) & 0xFF
+        pkt[0x0B] = len(data) >> 8
+        pkt += bytes(2)
+        pkt.extend(data)
+    checksum = _checksum(pkt, CHECKSUM_INIT) & 0xFFFF
+    pkt[0x06:0x08] = checksum.to_bytes(2, "little")
+    length = len(pkt) - 2
+    pkt[0x00:0x02] = length.to_bytes(2, "little")
+    err, dec = _send_cmd6a(
+        args.host, args.port, args.timeout, args.devtype,
+        args.mac, devid, key, iv, bytes(pkt),
+    )
+    if err != 0:
+        print(f"resp_err={err}")
+    return dec
+
+
+def cmd_dooya_action(args) -> int:
+    v2 = _is_dooya_v2(args.devtype, args.variant)
+    if args.action == "open":
+        if v2:
+            _dooya_v2_send(args, 2, bytes([0x00, 0x01, 0x00]))
+        else:
+            _dooya_v1_send(args, 0x01)
+    elif args.action == "close":
+        if v2:
+            _dooya_v2_send(args, 2, bytes([0x00, 0x02, 0x00]))
+        else:
+            _dooya_v1_send(args, 0x02)
+    elif args.action == "stop":
+        if v2:
+            _dooya_v2_send(args, 2, bytes([0x00, 0x03, 0x00]))
+        else:
+            _dooya_v1_send(args, 0x03)
+    elif args.action == "get":
+        if v2:
+            dec = _dooya_v2_send(args, 1, bytes([0x00, 0x06, 0x00]))
+            pos = dec[0x11] if len(dec) > 0x11 else None
+        else:
+            dec = _dooya_v1_send(args, 0x06, 0x5D)
+            pos = dec[0x04] if len(dec) > 0x04 else None
+        print(f"position={pos}")
+    elif args.action == "set":
+        if args.position is None:
+            raise ValueError("--position required for set")
+        pos = int(args.position)
+        if v2:
+            _dooya_v2_send(args, 2, bytes([0x00, 0x09, pos]))
+        else:
+            # v1 has no direct set; emulate with open/close+poll in library.
+            print("warning: v1 set not supported; use open/close/stop")
+            return 2
+    return 0
+
+
+# ---------- HVAC helpers ----------
+
+def _crc16_table(poly: int):
+    table = []
+    for dividend in range(256):
+        remainder = dividend
+        for _ in range(8):
+            if remainder & 1:
+                remainder = (remainder >> 1) ^ poly
+            else:
+                remainder >>= 1
+        table.append(remainder & 0xFFFF)
+    return table
+
+
+_CRC_TAB_9BE4 = _crc16_table(0x9BE4)
+
+
+def _crc16(data: bytes, init: int = 0xFFFF) -> int:
+    crc = init
+    for b in data:
+        crc = (crc >> 8) ^ _CRC_TAB_9BE4[(crc ^ b) & 0xFF]
+    return crc & 0xFFFF
+
+
+def _hvac_encode(data: bytes) -> bytes:
+    packet = bytearray(10)
+    p_len = 10 + len(data)
+    struct.pack_into("<HHHHH", packet, 0, p_len, 0x00BB, 0x8006, 0, len(data))
+    packet += data
+    crc = _crc16(packet[0x02:])
+    packet += crc.to_bytes(2, "little")
+    return bytes(packet)
+
+
+def _hvac_decode(dec: bytes) -> bytes:
+    if len(dec) < 12:
+        return b""
+    p_len = int.from_bytes(dec[:2], "little")
+    nom_crc = int.from_bytes(dec[p_len:p_len + 2], "little")
+    real_crc = _crc16(dec[0x02:p_len])
+    if nom_crc != real_crc:
+        raise ValueError(f"HVAC CRC mismatch: {nom_crc} != {real_crc}")
+    d_len = int.from_bytes(dec[0x08:0x0A], "little")
+    return dec[0x0A:0x0A + d_len]
+
+
+def _hvac_send(args, command: int, data: bytes = b"") -> bytes:
+    key = _parse_hex_bytes(args.key)
+    iv = _parse_hex_bytes(args.iv) if args.iv else INIT_IV
+    devid = _auto_int_hex(args.id)
+    prefix = bytes([((command << 4) | 1), 1])
+    inner = _hvac_encode(prefix + data)
+    err, dec = _send_cmd6a(
+        args.host, args.port, args.timeout, args.devtype,
+        args.mac, devid, key, iv, inner,
+    )
+    if err != 0:
+        print(f"resp_err={err}")
+        return b""
+    return _hvac_decode(dec)[0x02:]
+
+
+def _hvac_parse_state(d: bytes) -> dict:
+    state = {}
+    if len(d) < 13:
+        return state
+    state["power"] = bool(d[0x08] & (1 << 5))
+    state["target_temp"] = 8 + (d[0x00] >> 3) + ((d[0x04] >> 7) * 0.5)
+    state["swing_v"] = d[0x00] & 0b111
+    state["swing_h"] = d[0x01] >> 5
+    state["mode"] = d[0x05] >> 5
+    state["speed"] = d[0x03] >> 5
+    state["preset"] = d[0x04] >> 6
+    state["sleep"] = bool(d[0x05] & (1 << 2))
+    state["ifeel"] = bool(d[0x05] & (1 << 3))
+    state["health"] = bool(d[0x08] & (1 << 1))
+    state["clean"] = bool(d[0x08] & (1 << 2))
+    state["display"] = bool(d[0x0A] & (1 << 4))
+    state["mildew"] = bool(d[0x0A] & (1 << 3))
+    return state
+
+
+def cmd_hvac_get(args) -> int:
+    d = _hvac_send(args, 1)
+    print(_hvac_parse_state(d))
+    return 0
+
+
+def cmd_hvac_set(args) -> int:
+    # Build 13-byte data block like climate.hvac.set_state
+    tgt = float(args.target_temp)
+    tgt = round(tgt * 2) / 2
+    swing_v = int(args.swing_v)
+    swing_h = int(args.swing_h)
+    speed = int(args.speed)
+    preset = int(args.preset)
+    mode = int(args.mode)
+    sleep = 1 if args.sleep else 0
+    ifeel = 1 if args.ifeel else 0
+    display = 1 if args.display else 0
+    health = 1 if args.health else 0
+    clean = 1 if args.clean else 0
+    mildew = 1 if args.mildew else 0
+    power = 1 if args.on else 0
+
+    UNK0, UNK1, UNK2 = 0b100, 0b1101, 0b101
+    data = bytearray(0x0D)
+    data[0x00] = (int(tgt) - 8 << 3) | (swing_v & 0b111)
+    data[0x01] = (swing_h << 5) | UNK0
+    data[0x02] = (1 if (tgt % 1 == 0.5) else 0) << 7 | UNK1
+    data[0x03] = speed << 5
+    data[0x04] = preset << 6
+    data[0x05] = (mode << 5) | (sleep << 2) | (ifeel << 3)
+    data[0x08] = (power << 5) | (clean << 2) | (0b11 if health else 0)
+    data[0x0A] = (display << 4) | (mildew << 3)
+    data[0x0C] = UNK2
+    _ = _hvac_send(args, 0, bytes(data))
+    # Read back
+    return cmd_hvac_get(args)
+
+
+# ---------- Hysen thermostat helpers ----------
+
+def _crc16_ansi_table():
+    table = []
+    poly = 0xA001
+    for dividend in range(256):
+        remainder = dividend
+        for _ in range(8):
+            if remainder & 1:
+                remainder = (remainder >> 1) ^ poly
+            else:
+                remainder >>= 1
+        table.append(remainder & 0xFFFF)
+    return table
+
+
+_CRC_TAB_A001 = _crc16_ansi_table()
+
+
+def _crc16_ansi(data: bytes, init: int = 0xFFFF) -> int:
+    crc = init
+    for b in data:
+        crc = (crc >> 8) ^ _CRC_TAB_A001[(crc ^ b) & 0xFF]
+    return crc & 0xFFFF
+
+
+def _hysen_send_request(args, request: bytes) -> bytes:
+    key = _parse_hex_bytes(args.key)
+    iv = _parse_hex_bytes(args.iv) if args.iv else INIT_IV
+    devid = _auto_int_hex(args.id)
+    pkt = bytearray()
+    pkt.extend((len(request) + 2).to_bytes(2, "little"))
+    pkt.extend(request)
+    pkt.extend(_crc16_ansi(request).to_bytes(2, "little"))
+    err, dec = _send_cmd6a(
+        args.host, args.port, args.timeout, args.devtype,
+        args.mac, devid, key, iv, bytes(pkt),
+    )
+    if err != 0:
+        print(f"resp_err={err}")
+        return b""
+    p_len = int.from_bytes(dec[:2], "little")
+    nom_crc = int.from_bytes(dec[p_len:p_len + 2], "little")
+    real_crc = _crc16_ansi(dec[0x02:p_len])
+    if nom_crc != real_crc:
+        raise ValueError(f"Hysen CRC mismatch: {nom_crc} != {real_crc}")
+    return dec[0x02:p_len]
+
+
+def _hysen_decode_temp(payload: bytes, base_index: int) -> float:
+    base_temp = payload[base_index] / 2.0
+    add_offset = (payload[4] >> 3) & 1
+    offset_raw = (payload[17] >> 4) & 3
+    offset = (offset_raw + 1) / 10.0 if add_offset else 0.0
+    return base_temp + offset
+
+
+def cmd_hysen_temp(args) -> int:
+    # room/external temps
+    payload = _hysen_send_request(args, bytes([0x01, 0x03, 0x00, 0x00, 0x00, 0x08]))
+    room = _hysen_decode_temp(payload, 5) if len(payload) > 18 else None
+    external = _hysen_decode_temp(payload, 18) if len(payload) > 18 else None
+    if room is not None:
+        print(f"room_temp={room}")
+    if external is not None:
+        print(f"external_temp={external}")
+    return 0
+
+
+def cmd_hysen_get(args) -> int:
+    payload = _hysen_send_request(args, bytes([0x01, 0x03, 0x00, 0x00, 0x00, 0x16]))
+    if not payload:
+        return 1
+    data = {}
+    data["remote_lock"] = payload[3] & 1
+    data["power"] = payload[4] & 1
+    data["active"] = (payload[4] >> 4) & 1
+    data["temp_manual"] = (payload[4] >> 6) & 1
+    data["heating_cooling"] = (payload[4] >> 7) & 1
+    data["room_temp"] = _hysen_decode_temp(payload, 5)
+    data["thermostat_temp"] = payload[6] / 2.0
+    data["auto_mode"] = payload[7] & 0x0F
+    data["loop_mode"] = payload[7] >> 4
+    data["sensor"] = payload[8]
+    print(data)
+    return 0
+
+
+def cmd_hysen_set_temp(args) -> int:
+    temp2 = int(float(args.temp) * 2)
+    _ = _hysen_send_request(args, bytes([0x01, 0x06, 0x00, 0x01, 0x00, temp2]))
+    return cmd_hysen_get(args)
+
+
+def cmd_hysen_set_mode(args) -> int:
+    auto_mode = int(args.auto_mode)
+    loop_mode = int(args.loop_mode)
+    sensor = int(args.sensor)
+    mode_byte = ((loop_mode + 1) << 4) + auto_mode
+    _ = _hysen_send_request(args, bytes([0x01, 0x06, 0x00, 0x02, mode_byte, sensor]))
+    return cmd_hysen_get(args)
+
+
+def cmd_hysen_set_power(args) -> int:
+    power = 1 if args.on else 0
+    remote_lock = 1 if args.remote_lock else 0
+    heating_cooling = 1 if args.cooling else 0
+    state = (heating_cooling << 7) + power
+    _ = _hysen_send_request(args, bytes([0x01, 0x06, 0x00, 0x00, remote_lock, state]))
+    return cmd_hysen_get(args)
+
+
+def _pack_datetime_now() -> bytes:
+    # Same layout as broadlink.protocol.Datetime.pack
+    # utc offset in hours (signed), year (LE), minute, hour, YY, isoweekday, day, month
+    import datetime as dt
+
+    tz = dt.timezone(dt.timedelta(seconds=-time.timezone))
+    now = dt.datetime.now(tz)
+    data = bytearray(12)
+    utcoffset = int(now.utcoffset().total_seconds() / 3600)
+    data[:0x04] = utcoffset.to_bytes(4, "little", signed=True)
+    data[0x04:0x06] = now.year.to_bytes(2, "little")
+    data[0x06] = now.minute
+    data[0x07] = now.hour
+    data[0x08] = int(now.strftime("%y"))
+    data[0x09] = now.isoweekday()
+    data[0x0A] = now.day
+    data[0x0B] = now.month
+    return bytes(data)
+
+
+def cmd_hello(args) -> int:
+    pkt = bytearray(0x30)
+    pkt[0x08:0x14] = _pack_datetime_now()
+    pkt[0x18:0x1C] = socket.inet_aton(args.src_ip or "0.0.0.0")[::-1]
+    pkt[0x1C:0x1E] = (args.src_port or 0).to_bytes(2, "little")
+    pkt[0x26] = 6
+    chk = _checksum(pkt)
+    pkt[0x20:0x22] = chk.to_bytes(2, "little")
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.settimeout(args.timeout)
+        s.sendto(pkt, (args.host, args.port))
+        resp = s.recvfrom(2048)[0]
+
+    devtype = resp[0x34] | (resp[0x35] << 8)
+    mac = resp[0x3A:0x40][::-1]
+    name = resp[0x40:].split(b"\x00")[0].decode(errors="ignore")
+    locked = bool(resp[0x7F]) if len(resp) > 0x7F else False
+    print(
+        "{"
+        f"\"devtype\": {hex(devtype)}, "
+        f"\"mac\": \"{mac.hex()}\", "
+        f"\"name\": \"{name}\", "
+        f"\"locked\": {str(locked).lower()}"
+        "}"
+    )
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Broadlink UDP control tool")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # Common arg factory
+    def add_common(p):
+        p.add_argument("--host", required=True, help="device IP address")
+        p.add_argument("--port", type=int, default=DEFAULT_PORT, help="UDP port")
+        p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+        p.add_argument(
+            "--mac",
+            type=_parse_hex_bytes,
+            required=False,
+            help="device MAC hex (aa11bb22cc33 or aa:11:bb:22:cc:33)",
+        )
+        p.add_argument(
+            "--devtype",
+            type=_auto_int_hex,
+            required=False,
+            default=0,
+            help="device type/product id (e.g. 0x2712)",
+        )
+
+    # auth
+    p_auth = sub.add_parser("auth", help="authenticate and get AES key + id")
+    add_common(p_auth)
+    p_auth.add_argument("--name", help="name string (<=6 chars)")
+    p_auth.set_defaults(func=cmd_auth)
+
+    # send
+    p_send = sub.add_parser("send", help="send generic packet (default 0x6A)")
+    add_common(p_send)
+    p_send.add_argument(
+        "--packet-type", type=_auto_int_hex, default=0x6A, help="packet type"
+    )
+    p_send.add_argument("--id", required=False, help="device id (LE) hex/int")
+    p_send.add_argument("--key", required=False, help="AES key (hex)")
+    p_send.add_argument("--iv", required=False, help="AES IV (hex)")
+    p_send.add_argument("--count", required=False, help="packet counter (int)")
+    p_send.add_argument(
+        "--payload",
+        required=True,
+        help="unencrypted payload hex (will be AES-CBC encrypted)",
+    )
+    p_send.set_defaults(func=cmd_send)
+
+    # ping
+    p_ping = sub.add_parser("ping", help="send watchdog ping (0x30 bytes)")
+    p_ping.add_argument("--host", required=True, help="device IP address")
+    p_ping.add_argument("--port", type=int, default=DEFAULT_PORT, help="UDP port")
+    p_ping.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    p_ping.set_defaults(func=cmd_ping)
+
+    # hello to a specific host:port (unicast)
+    p_hello = sub.add_parser("hello", help="send discovery hello to a host")
+    p_hello.add_argument("--host", required=True, help="target IP address")
+    p_hello.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p_hello.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    p_hello.add_argument("--src-ip", default=None, help="source IP to include")
+    p_hello.add_argument("--src-port", type=int, default=0)
+    p_hello.set_defaults(func=cmd_hello)
+
+    # RM subcommands
+    p_rm_learn = sub.add_parser(
+        "rm-learn", help="RM enter IR learning mode"
+    )
+    add_common(p_rm_learn)
+    p_rm_learn.add_argument("--id", required=True)
+    p_rm_learn.add_argument("--key", required=False)
+    p_rm_learn.add_argument("--iv", required=False)
+    p_rm_learn.set_defaults(func=cmd_rm_learn)
+
+    p_rm_check = sub.add_parser(
+        "rm-check", help="RM check last learned code"
+    )
+    add_common(p_rm_check)
+    p_rm_check.add_argument("--id", required=True)
+    p_rm_check.add_argument("--key", required=True)
+    p_rm_check.add_argument("--iv", required=False)
+    p_rm_check.set_defaults(func=cmd_rm_check)
+
+    p_rm_send = sub.add_parser("rm-send", help="RM send IR/RF code")
+    add_common(p_rm_send)
+    p_rm_send.add_argument("--id", required=True)
+    p_rm_send.add_argument("--key", required=True)
+    p_rm_send.add_argument("--iv", required=False)
+    p_rm_send.add_argument("--data", required=True, help="code hex")
+    p_rm_send.set_defaults(func=cmd_rm_send)
+
+    p_rm_rf = sub.add_parser("rm-rf", help="RM RF operations")
+    add_common(p_rm_rf)
+    p_rm_rf.add_argument("--id", required=True)
+    p_rm_rf.add_argument("--key", required=True)
+    p_rm_rf.add_argument("--iv", required=False)
+    p_rm_rf.add_argument(
+        "--action",
+        choices=["sweep", "check", "find", "cancel"],
+        required=True,
+    )
+    p_rm_rf.add_argument("--frequency", required=False, help="MHz for find")
+    p_rm_rf.set_defaults(func=cmd_rm_rf_ops)
+
+    p_rm4_sensors = sub.add_parser(
+        "rm4-sensors", help="RM4 temperature/humidity"
+    )
+    add_common(p_rm4_sensors)
+    p_rm4_sensors.add_argument("--id", required=True)
+    p_rm4_sensors.add_argument("--key", required=True)
+    p_rm4_sensors.add_argument("--iv", required=False)
+    p_rm4_sensors.set_defaults(func=cmd_rm4_sensors)
+
+    # SP2 basic
+    p_sp2_g = sub.add_parser("sp2-get", help="SP2 get power state")
+    add_common(p_sp2_g)
+    p_sp2_g.add_argument("--id", required=True)
+    p_sp2_g.add_argument("--key", required=True)
+    p_sp2_g.add_argument("--iv", required=False)
+    p_sp2_g.set_defaults(func=cmd_sp2_get_power)
+
+    p_sp2_s = sub.add_parser("sp2-set", help="SP2 set power state")
+    add_common(p_sp2_s)
+    p_sp2_s.add_argument("--id", required=True)
+    p_sp2_s.add_argument("--key", required=True)
+    p_sp2_s.add_argument("--iv", required=False)
+    grp = p_sp2_s.add_mutually_exclusive_group(required=True)
+    grp.add_argument("--on", action="store_true")
+    grp.add_argument("--off", action="store_true")
+    p_sp2_s.set_defaults(func=cmd_sp2_set_power)
+
+    # SP4 JSON
+    p_sp4_g = sub.add_parser("sp4-get", help="SP4/SP4B get JSON state")
+    add_common(p_sp4_g)
+    p_sp4_g.add_argument("--id", required=True)
+    p_sp4_g.add_argument("--key", required=True)
+    p_sp4_g.add_argument("--iv", required=False)
+    p_sp4_g.add_argument(
+        "--variant", choices=["a", "b"], default="a", help="protocol variant"
+    )
+    p_sp4_g.set_defaults(func=cmd_sp4_get)
+
+    p_sp4_s = sub.add_parser("sp4-set", help="SP4/SP4B set JSON state")
+    add_common(p_sp4_s)
+    p_sp4_s.add_argument("--id", required=True)
+    p_sp4_s.add_argument("--key", required=True)
+    p_sp4_s.add_argument("--iv", required=False)
+    p_sp4_s.add_argument(
+        "--variant", choices=["a", "b"], default="a", help="protocol variant"
+    )
+    p_sp4_s.add_argument(
+        "--state",
+        nargs="+",
+        required=True,
+        help="key=value pairs (e.g., pwr=1 ntlight=0)",
+    )
+    p_sp4_s.set_defaults(func=cmd_sp4_set)
+
+    # SP2S energy
+    p_sp2s = sub.add_parser("sp2s-energy", help="SP2S get power consumption")
+    add_common(p_sp2s)
+    p_sp2s.add_argument("--id", required=True)
+    p_sp2s.add_argument("--key", required=True)
+    p_sp2s.add_argument("--iv", required=False)
+    p_sp2s.set_defaults(func=cmd_sp2s_energy)
+
+    # A1 sensors
+    p_a1 = sub.add_parser("a1-sensors", help="A1 read sensors")
+    add_common(p_a1)
+    p_a1.add_argument("--id", required=True)
+    p_a1.add_argument("--key", required=True)
+    p_a1.add_argument("--iv", required=False)
+    p_a1.set_defaults(func=cmd_a1_sensors)
+
+    # SP3 shortcuts
+    p_sp3_gp = sub.add_parser("sp3-get-power", help="SP3 get power")
+    add_common(p_sp3_gp)
+    p_sp3_gp.add_argument("--id", required=True)
+    p_sp3_gp.add_argument("--key", required=True)
+    p_sp3_gp.add_argument("--iv", required=False)
+    p_sp3_gp.set_defaults(func=cmd_sp3_get_power)
+
+    p_sp3_gn = sub.add_parser("sp3-get-nl", help="SP3 get nightlight")
+    add_common(p_sp3_gn)
+    p_sp3_gn.add_argument("--id", required=True)
+    p_sp3_gn.add_argument("--key", required=True)
+    p_sp3_gn.add_argument("--iv", required=False)
+    p_sp3_gn.set_defaults(func=cmd_sp3_get_nl)
+
+    p_sp3_sp = sub.add_parser("sp3-set-power", help="SP3 set power")
+    add_common(p_sp3_sp)
+    p_sp3_sp.add_argument("--id", required=True)
+    p_sp3_sp.add_argument("--key", required=True)
+    p_sp3_sp.add_argument("--iv", required=False)
+    grp = p_sp3_sp.add_mutually_exclusive_group(required=True)
+    grp.add_argument("--on", action="store_true")
+    grp.add_argument("--off", action="store_true")
+    p_sp3_sp.set_defaults(func=cmd_sp3_set_power)
+
+    p_sp3_sn = sub.add_parser("sp3-set-nl", help="SP3 set nightlight")
+    add_common(p_sp3_sn)
+    p_sp3_sn.add_argument("--id", required=True)
+    p_sp3_sn.add_argument("--key", required=True)
+    p_sp3_sn.add_argument("--iv", required=False)
+    grp = p_sp3_sn.add_mutually_exclusive_group(required=True)
+    grp.add_argument("--on", action="store_true")
+    grp.add_argument("--off", action="store_true")
+    p_sp3_sn.set_defaults(func=cmd_sp3_set_nl)
+
+    # MP1 shortcuts
+    p_mp1_g = sub.add_parser("mp1-get", help="MP1 get outlets state")
+    add_common(p_mp1_g)
+    p_mp1_g.add_argument("--id", required=True)
+    p_mp1_g.add_argument("--key", required=True)
+    p_mp1_g.add_argument("--iv", required=False)
+    p_mp1_g.set_defaults(func=cmd_mp1_get)
+
+    p_mp1_s = sub.add_parser("mp1-set", help="MP1 set outlet state")
+    add_common(p_mp1_s)
+    p_mp1_s.add_argument("--id", required=True)
+    p_mp1_s.add_argument("--key", required=True)
+    p_mp1_s.add_argument("--iv", required=False)
+    sidgrp = p_mp1_s.add_mutually_exclusive_group(required=True)
+    sidgrp.add_argument("--sid", type=int, help="outlet index 1..4")
+    sidgrp.add_argument("--mask", help="bitmask (e.g., 0x3)")
+    ongrp = p_mp1_s.add_mutually_exclusive_group(required=True)
+    ongrp.add_argument("--on", action="store_true")
+    ongrp.add_argument("--off", action="store_true")
+    p_mp1_s.set_defaults(func=cmd_mp1_set)
+
+    # Dooya covers
+    p_dooya = sub.add_parser("dooya", help="Dooya curtain actions")
+    add_common(p_dooya)
+    p_dooya.add_argument("--id", required=True)
+    p_dooya.add_argument("--key", required=True)
+    p_dooya.add_argument("--iv", required=False)
+    p_dooya.add_argument(
+        "--variant", choices=["v1", "v2"], default=None, help="protocol version"
+    )
+    p_dooya.add_argument(
+        "--action", choices=["open", "close", "stop", "get", "set"], required=True
+    )
+    p_dooya.add_argument("--position", type=int, help="0..100 for set")
+    p_dooya.set_defaults(func=cmd_dooya_action)
+
+    # HVAC
+    p_hvac_g = sub.add_parser("hvac-get", help="HVAC get state")
+    add_common(p_hvac_g)
+    p_hvac_g.add_argument("--id", required=True)
+    p_hvac_g.add_argument("--key", required=True)
+    p_hvac_g.add_argument("--iv", required=False)
+    p_hvac_g.set_defaults(func=cmd_hvac_get)
+
+    p_hvac_s = sub.add_parser("hvac-set", help="HVAC set state")
+    add_common(p_hvac_s)
+    p_hvac_s.add_argument("--id", required=True)
+    p_hvac_s.add_argument("--key", required=True)
+    p_hvac_s.add_argument("--iv", required=False)
+    p_hvac_s.add_argument("--on", action="store_true", help="power on (off if omitted)")
+    p_hvac_s.add_argument("--target-temp", required=True, type=float)
+    p_hvac_s.add_argument("--mode", required=True, type=int, help="0=AUTO,1=COOL,2=DRY,3=HEAT,4=FAN")
+    p_hvac_s.add_argument("--speed", required=True, type=int, help="1=HIGH,2=MID,3=LOW,5=AUTO")
+    p_hvac_s.add_argument("--preset", required=True, type=int, help="0=NORMAL,1=TURBO,2=MUTE")
+    p_hvac_s.add_argument("--swing-h", required=True, type=int, help="0=ON,7=OFF")
+    p_hvac_s.add_argument("--swing-v", required=True, type=int, help="0..5 or 7=OFF")
+    p_hvac_s.add_argument("--sleep", action="store_true")
+    p_hvac_s.add_argument("--ifeel", action="store_true")
+    p_hvac_s.add_argument("--display", action="store_true")
+    p_hvac_s.add_argument("--health", action="store_true")
+    p_hvac_s.add_argument("--clean", action="store_true")
+    p_hvac_s.add_argument("--mildew", action="store_true")
+    p_hvac_s.set_defaults(func=cmd_hvac_set)
+
+    # Hysen
+    p_hys_t = sub.add_parser("hysen-temp", help="Hysen read temperatures")
+    add_common(p_hys_t)
+    p_hys_t.add_argument("--id", required=True)
+    p_hys_t.add_argument("--key", required=True)
+    p_hys_t.add_argument("--iv", required=False)
+    p_hys_t.set_defaults(func=cmd_hysen_temp)
+
+    p_hys_g = sub.add_parser("hysen-get", help="Hysen read full status")
+    add_common(p_hys_g)
+    p_hys_g.add_argument("--id", required=True)
+    p_hys_g.add_argument("--key", required=True)
+    p_hys_g.add_argument("--iv", required=False)
+    p_hys_g.set_defaults(func=cmd_hysen_get)
+
+    p_hys_st = sub.add_parser("hysen-set-temp", help="Hysen set target temp")
+    add_common(p_hys_st)
+    p_hys_st.add_argument("--id", required=True)
+    p_hys_st.add_argument("--key", required=True)
+    p_hys_st.add_argument("--iv", required=False)
+    p_hys_st.add_argument("--temp", required=True)
+    p_hys_st.set_defaults(func=cmd_hysen_set_temp)
+
+    p_hys_sm = sub.add_parser("hysen-set-mode", help="Hysen set mode/loop/sensor")
+    add_common(p_hys_sm)
+    p_hys_sm.add_argument("--id", required=True)
+    p_hys_sm.add_argument("--key", required=True)
+    p_hys_sm.add_argument("--iv", required=False)
+    p_hys_sm.add_argument("--auto-mode", required=True, help="1=auto, 0=manual")
+    p_hys_sm.add_argument("--loop-mode", required=True, help="0,1,2")
+    p_hys_sm.add_argument("--sensor", required=True, help="0=int,1=ext,2=both")
+    p_hys_sm.set_defaults(func=cmd_hysen_set_mode)
+
+    p_hys_sp = sub.add_parser("hysen-set-power", help="Hysen set power/lock/cooling")
+    add_common(p_hys_sp)
+    p_hys_sp.add_argument("--id", required=True)
+    p_hys_sp.add_argument("--key", required=True)
+    p_hys_sp.add_argument("--iv", required=False)
+    p_hys_sp.add_argument("--on", action="store_true")
+    p_hys_sp.add_argument("--remote-lock", action="store_true")
+    p_hys_sp.add_argument("--cooling", action="store_true", help="cooling=1, heating=0")
+    p_hys_sp.set_defaults(func=cmd_hysen_set_power)
+
+    args = parser.parse_args()
+
+    # Validate required MAC for commands that need header fields
+    if args.cmd in (
+        "auth",
+        "send",
+        "rm-learn",
+        "rm-check",
+        "rm-send",
+        "rm-rf",
+        "rm4-sensors",
+        "sp2-get",
+        "sp2-set",
+        "sp4-get",
+        "sp4-set",
+        "sp2s-energy",
+        "a1-sensors",
+        "sp3-get-power",
+        "sp3-get-nl",
+        "sp3-set-power",
+        "sp3-set-nl",
+        "mp1-get",
+        "mp1-set",
+        "dooya",
+        "hvac-get",
+        "hvac-set",
+        "hysen-temp",
+        "hysen-get",
+        "hysen-set-temp",
+        "hysen-set-mode",
+        "hysen-set-power",
+    ) and not getattr(args, "mac", None):
+        print("--mac is required for this command", file=sys.stderr)
+        return 2
+
+    try:
+        return args.func(args)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
